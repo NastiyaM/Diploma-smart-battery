@@ -14,6 +14,7 @@ import random
 import pandas as pd
 from tqdm import tqdm
 import tensorflow as tf
+from sklearn import preprocessing
 
 class Battery(object):
     """ Used to store information about the battery.
@@ -47,16 +48,29 @@ class Simulation(object):
     def __init__(self,
                  data,
                  battery,
-                 site_id, act):
-        """ Creates initial simulation state based on data passed in.
-            :param data: contains all the time series needed over the considered period
-            :param battery: is a battery instantiated with 0 charge and the relevant properties
-            :param site_id: the id for the site (building)
-        """
+                 site_id, act, done, money_spent_cumulative, money_spent_without_battery_cumulative):
+
         self.act = act
         self.data = data
 
         # building initialization
+        # self.actual_previous_load = self.data.actual_consumption.values[0]
+        # self.actual_previous_pv = self.data.actual_pv.values[0]
+
+        # align actual as the following, not the previous 15 minutes to
+        # simplify simulation
+        # self.data.loc[:, 'actual_consumption'] = self.data.actual_consumption.shift(-1)
+        # self.data.loc[:, 'actual_pv'] = self.data.actual_pv.shift(-1)
+
+        # self.site_id = site_id
+        # self.load_columns = data.columns.str.startswith('load_')
+        # self.pv_columns = data.columns.str.startswith('pv_')
+        # self.price_sell_columns = data.columns.str.startswith('price_sell_')
+        # self.price_buy_columns = data.columns.str.startswith('price_buy_')
+
+        # building initialization
+        self.money_spent_cumulative = money_spent_cumulative
+        self.money_spent_without_battery_cumulative = money_spent_without_battery_cumulative
 
         # initialize money at 0.0
         self.money_spent = 0.0
@@ -64,21 +78,31 @@ class Simulation(object):
 
         # battery initialization
         self.battery = battery
-        self.reward = 0.0
 
     def run(self):
         """ Executes the simulation by iterating through each of the data points
             It returns both the electricity cost spent using the battery and the
             cost that would have been incurred with no battery.
         """
+
+        # for current_time, timestep in tqdm(self.data.iterrows(), total=self.data.shape[0], desc=' > > > > timesteps\t'):
+        # can't calculate results without actual, so skip (should only be last row)
         timestep = self.data
         if pd.notnull(timestep.actual_consumption):
-            self.simulate_timestep(timestep, self.act)
-        # return self.money_spent, self.money_spent_without_battery
-        return self.battery.current_charge, self.reward, (self.money_spent - self.money_spent_without_battery) / np.abs(
-            self.money_spent_without_battery)
+            self.simulate_timestep(self.act, timestep)
 
-    def simulate_timestep(self, timestep, act):
+        if self.money_spent < self.money_spent_without_battery:
+            self.reward = 1 + np.abs(self.money_spent_cumulative - self.money_spent_without_battery_cumulative)
+            # self.reward = 1
+            print(')')
+        else:
+            # self.reward = 1-np.abs(self.money_spent_cumulative - self.money_spent_without_battery_cumulative)
+            self.reward = 0
+            print('(')
+
+        return self.battery.current_charge, self.reward, self.money_spent_cumulative, self.money_spent_without_battery_cumulative
+
+    def simulate_timestep(self, act, timestep):
         """ Executes a single timestep using `battery_controller` to get
             a proposed state of charge and then calculating the cost of
             making those changes.
@@ -87,21 +111,16 @@ class Simulation(object):
             :param timestep: the data available at this timestep
         """
         # get proposed state of charge from the battery controller
-        charging_efficiency = self.battery.charging_efficiency
-        discharging_efficiency = 1. / self.battery.discharging_efficiency
-        capacity = self.battery.capacity
         if self.act > 0:
-            proposed_state_of_charge = self.battery.current_charge + self.act * charging_efficiency
+            proposed_state_of_charge = self.battery.current_charge + self.act * self.battery.charging_efficiency
         else:
-            proposed_state_of_charge = self.battery.current_charge + self.act * discharging_efficiency
-
-        proposed_state_of_charge = self.battery.current_charge + self.act
+            proposed_state_of_charge = self.battery.current_charge + self.act * 1. / self.battery.discharging_efficiency
 
         # get energy required to achieve the proposed state of charge
         grid_energy, battery_energy_change = self.simulate_battery_charge(self.battery.current_charge,
                                                                           proposed_state_of_charge,
-                                                                          timestep.actual_consumption / 1000,
-                                                                          timestep.actual_pv / 1000, timestep)
+                                                                          timestep.actual_consumption,
+                                                                          timestep.actual_pv)
 
         grid_energy_without_battery = timestep.actual_consumption - timestep.actual_pv
 
@@ -112,16 +131,14 @@ class Simulation(object):
         # calculate spending based on price per kWh and energy per Wh
         self.money_spent += grid_energy * (price / 1000.)
         self.money_spent_without_battery += grid_energy_without_battery * (price_without_battery / 1000.)
-
+        self.money_spent_cumulative = money_spent_cumulative + self.money_spent
+        self.money_spent_without_battery_cumulative = money_spent_without_battery_cumulative + self.money_spent_without_battery
         # update current state of charge
-        self.battery.current_charge += battery_energy_change
-        self.actual_previous_load = timestep.actual_consumption
-        self.actual_previous_pv = timestep.actual_pv
-        self.reward = self.money_spent
-        # return self.battery.current_charge, price
+        self.battery.current_charge += battery_energy_change / self.battery.capacity
+        # self.actual_previous_load = timestep.actual_consumption
+        # self.actual_previous_pv = timestep.actual_pv
 
-    def simulate_battery_charge(self, initial_state_of_charge, proposed_state_of_charge, actual_consumption, actual_pv,
-                                timestep):
+    def simulate_battery_charge(self, initial_state_of_charge, proposed_state_of_charge, actual_consumption, actual_pv):
         """ Charges or discharges the battery based on what is desired and
             available energy from grid and pv.
             :param initial_state_of_charge: the current state of the battery
@@ -130,36 +147,34 @@ class Simulation(object):
             :param actual_pv: the actual pv energy produced and available to the building
         """
         # charge is bounded by what is feasible
-        proposed_state_of_charge = np.clip(proposed_state_of_charge, 0.0, self.battery.capacity)
+        proposed_state_of_charge = np.clip(proposed_state_of_charge, 0.0, 1.0)
 
         # calculate proposed energy change in the battery
-        target_energy_change = (proposed_state_of_charge - initial_state_of_charge)
+        target_energy_change = (proposed_state_of_charge - initial_state_of_charge) * self.battery.capacity
 
         # efficiency can be different whether we intend to charge or discharge
         if target_energy_change >= 0:
             efficiency = self.battery.charging_efficiency
-            target_charging_power = target_energy_change / (efficiency)
+            target_charging_power = target_energy_change / ((15. / 60.) * efficiency)
         else:
             efficiency = self.battery.discharging_efficiency
-            target_charging_power = target_energy_change * efficiency
+            target_charging_power = target_energy_change * efficiency / (15. / 60.)
 
-            # actual power is bounded by the properties of the battery
+        # actual power is bounded by the properties of the battery
         actual_charging_power = np.clip(target_charging_power,
                                         self.battery.discharging_power_limit,
                                         self.battery.charging_power_limit)
 
         # actual energy change is based on the actual power possible and the efficiency
         if actual_charging_power >= 0:
-            actual_energy_change = actual_charging_power * efficiency
+            actual_energy_change = actual_charging_power * (15. / 60.) * efficiency
         else:
-            actual_energy_change = actual_charging_power / efficiency
+            actual_energy_change = actual_charging_power * (15. / 60.) / efficiency
 
         # what we need from the grid = (the power put into the battery + the consumption) - what is available from pv
-        grid_energy = (actual_charging_power + actual_consumption) - actual_pv
-        price = timestep.price_buy_00 if grid_energy >= 0 else timestep.price_sell_00
+        grid_energy = (actual_charging_power * (15. / 60.) + actual_consumption) - actual_pv
 
         # if positive, we are buying from the grid; if negative, we are selling
-
         return grid_energy, actual_energy_change
 
 """
@@ -392,32 +407,42 @@ if __name__ == '__main__':
                 state_size = 391
                 action_size = 12
                 steps = []
-                i = 0
+                i = 1
+                state = list(site_data.iloc[i])[2:]
+                state.append(site_data.iloc[i - 1].price_sell_00)
+                state.append(site_data.iloc[i - 1].price_buy_00)
+                state.append(site_data.index[i].weekday())
+                state.append(int(site_data.index[i].hour * 4 + site_data.index[i].minute / 15))
+                state = list(preprocessing.normalize([state])[0])
+                state.append(batt.current_charge)
+                state = np.reshape(state, [1, state_size])
                 for index_episode in range(episodes):
-                    batt.current_charge = 0
-                    state = list(site_data.iloc[i])
-                    state.append(batt.current_charge)
-                    state = np.reshape(state, [1, state_size])
+                    money_spent_cumulative = 0
+                    money_spent_without_battery_cumulative = 0
                     done = False
                     while not done:
-                        if i == (len(site_data) - 1):
-                            break
+                        i += 1
                         Timestamp = site_data.index[i]
-                        action = agent.act(state)
-                        if agent == 'agent_DQN':
-                            pw = d[action]
-                        sim = Simulation(site_data.iloc[i + 1], batt, site_id, pw)
-                        batt.current_charge, rew, sc = sim.run()
-                        next_state = list(site_data.iloc[i + 1])
-                        next_state.append(batt.current_charge)
-                        reward = rew
                         if Timestamp.hour == 00 and Timestamp.minute == 00:
                             done = True
                         else:
                             done = False
+                        action = agent.act(state)
+                        if agent == 'agent_DQN':
+                            pw = d[action]
+                        site_data_sim = site_data.iloc[i]
+                        sim = Simulation(site_data_sim, batt, site_id, pw, done, money_spent_cumulative, money_spent_without_battery_cumulative)
+                        batt.current_charge, rew, money_spent_cumulative, money_spent_without_battery_cumulative = sim.run()
+                        next_state = list(site_data.iloc[i])[2:]
+                        next_state.append(site_data.iloc[i - 1].price_sell_00)
+                        next_state.append(site_data.iloc[i - 1].price_buy_00)
+                        next_state.append(site_data.index[i].weekday())
+                        next_state.append(int(site_data.index[i].hour * 4 + site_data.index[i].minute / 15))
+                        next_state = list(preprocessing.normalize([next_state])[0])
+                        next_state.append(batt.current_charge)
+                        reward = rew
                         next_state = np.reshape(next_state, [1, state_size])
                         agent.remember(state, action, reward, next_state, done)
-                        i += 1
                         if agent == 'agent_DQN':
                             agent.replay()
                             agent.target_train()
@@ -425,13 +450,15 @@ if __name__ == '__main__':
                             agent.train()
                         state = next_state
                     sc = 0
+                    money_spent_cumulative = 0
+                    money_spent_without_battery_cumulative = 0
                     for j in range(96):
                         state_test = list(site_data.iloc[j])
                         state_test.append(0)
                         state_test = np.reshape(state, [1, state_size])
                         action_test = agent.act(state)
                         pw = d[action]
-                        sim = Simulation(site_data.iloc[j + 1], batt, site_id, pw)
+                        sim = Simulation(site_data_sim, batt, site_id, pw, done, money_spent_cumulative, money_spent_without_battery_cumulative)
                         batt.current_charge, rew, sc = sim.run()
                         sc += rew
                     score[agent].append(sc/j)
